@@ -1,0 +1,299 @@
+# Vendor Contract Red-Flag Scanner — Replit Agent Prompt
+---
+## ROLE & OBJECTIVE
+
+You are building a production-ready, single-page web application called **ContractGuard** — a Vendor Contract Red-Flag Scanner for small and mid-sized teams who cannot afford legal review on every contract they sign.
+
+The app accepts a PDF or plain-text contract upload, runs structured AI analysis across 10 legal risk categories, and returns an interactive risk dashboard where each flagged clause requires a deliberate human decision before a final report is generated. This is not a summarizer. It is a decision-forcing workflow tool.
+
+Build this end-to-end in a single Replit project. Ship a working, demo-able product.
+---
+## TECH STACK — NO DEVIATIONS
+- **Runtime:** Node.js (latest LTS)
+- **Framework:** Express.js (backend API) + vanilla HTML/CSS/JS (frontend, single `index.html`)
+- **PDF parsing:** `pdf-parse` npm package
+- **AI:** Anthropic Claude API via `@anthropic-ai/sdk` — use `claude-sonnet-4-20250514`
+- **Storage:** In-memory only (no database, no filesystem writes beyond temp). Session state lives in a server-side `Map` keyed by a UUID generated per upload.
+- **Environment:** API key loaded from Replit Secrets as `ANTHROPIC_API_KEY`. Never hardcode it. Crash on startup with a clear message if the secret is missing.
+- **Port:** `process.env.PORT || 3000`
+Do not introduce React, Vite, Tailwind, Prisma, or any database. Do not use TypeScript. Keep the dependency footprint minimal.
+---
+## FILE STRUCTURE
+```
+/
+├── index.js            # Express server, all API routes
+├── analyzer.js         # Claude API call logic, prompt construction, response parsing
+├── extractor.js        # PDF and plain-text extraction logic
+├── public/
+│   └── index.html      # Entire frontend — HTML, CSS, JS in one file
+├── package.json
+└── .replit             # start command: node index.js
+```
+---
+## CORE USER FLOW
+```
+Upload contract (PDF or .txt)
+        │
+        ▼
+Extract raw text → chunk if >12,000 tokens
+        │
+        ▼
+Send to Claude with structured analysis prompt
+        │
+        ▼
+Parse JSON response → 10 risk category scores + flagged clauses
+        │
+        ▼
+Render Risk Dashboard (scores, flags, clause excerpts)
+        │
+        ▼
+Human reviews each flag → marks Accept / Escalate / Request Redline
+        │
+        ▼ (all flags actioned)
+Generate & download Final Report (HTML print-ready)
+```
+---
+## BACKEND — `index.js`
+### Routes
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Serve `public/index.html` |
+| `POST` | `/api/upload` | Accept multipart upload, extract text, return `sessionId` |
+| `POST` | `/api/analyze` | Trigger Claude analysis for a `sessionId`, return risk JSON |
+| `POST` | `/api/decision` | Record a human decision for one flag (`accept/escalate/redline`) |
+| `GET` | `/api/report/:sessionId` | Return full session state for report generation |
+| `DELETE` | `/api/session/:sessionId` | Purge session from memory |
+
+### Session Object Shape
+
+```js
+{
+  sessionId: "uuid-v4",
+  filename: "contract.pdf",
+  rawText: "...",          // extracted full text
+  charCount: 42000,
+  uploadedAt: Date.now(),
+  analysis: null,          // populated after /api/analyze
+  decisions: {}            // keyed by flagId: { action, note, decidedAt }
+}
+```
+### Timeouts & Limits
+- Max upload size: **5 MB**. Reject with `413` and a user-readable message.
+- Accepted MIME types: `application/pdf`, `text/plain`. Reject anything else with `415`.
+- Session TTL: 30 minutes. Run a `setInterval` every 5 minutes to purge expired sessions.
+- Claude API call timeout: 60 seconds. If it exceeds this, return `504` with `"Analysis timed out — try with a shorter contract."`.
+---
+## TEXT EXTRACTION — `extractor.js`
+### PDF Extraction
+Use `pdf-parse`. Wrap in try/catch. Handle these failure modes explicitly:
+
+- **Encrypted/password-protected PDF:** `pdf-parse` throws on these. Catch the error, return `{ error: "PDF is password-protected. Please unlock it before uploading." }`.
+- **Scanned image PDF (no text layer):** `pdf-parse` returns text of length < 200 characters. Detect this by checking `data.text.trim().length < 200`. Return `{ error: "This PDF appears to be a scanned image with no text layer. Please upload a text-based PDF or paste the contract text directly." }`.
+- **Corrupt PDF:** Any other `pdf-parse` exception. Return `{ error: "Could not parse this PDF. Try saving it as a new PDF or uploading a .txt version." }`.
+
+### Plain Text
+Read buffer as UTF-8. Trim. If empty after trim, return `{ error: "Uploaded file contains no readable text." }`.
+### Post-Extraction Sanitization
+After successful extraction:
+1. Normalize line endings to `\n`.
+2. Collapse runs of 3+ blank lines to 2 blank lines.
+3. Strip null bytes and non-printable characters (except `\t` and `\n`).
+4. Cap at **50,000 characters**. If over, truncate and append `\n\n[TRUNCATED — document exceeds analysis limit. Clauses beyond this point were not reviewed.]`. Surface this truncation warning to the user on the dashboard.
+---
+## AI ANALYSIS — `analyzer.js`
+### Prompt Architecture
+Construct the Claude prompt as follows. Do NOT use a conversational format. Use a single user message with a structured system prompt.
+
+**System prompt:**
+```
+You are a contract risk analysis engine. You extract and score legal risk from vendor contracts for non-lawyer business operators. You are precise, clause-specific, and non-alarmist. You never give legal advice. You identify risk signals and surface them for human review.
+Output ONLY valid JSON. No markdown, no explanation, no preamble. If a category has no relevant clauses, return an empty flags array for it.
+```
+**User message structure:**
+```
+Analyze the following vendor contract for legal risk across exactly these 10 categories:
+1. AUTO_RENEWAL — automatic renewal terms, notice windows, evergreen clauses
+2. TERMINATION — termination for convenience, cure periods, termination fees
+3. LIABILITY_CAP — limitation of liability, exclusions, damage caps relative to contract value
+4. IP_OWNERSHIP — who owns work product, IP assignment, license grants, moral rights
+5. DATA_RIGHTS — data usage, sharing, retention, processing by vendor, GDPR/CCPA exposure
+6. INDEMNIFICATION — indemnification scope, mutual vs one-sided, defense obligations
+7. GOVERNING_LAW — jurisdiction, dispute resolution, arbitration clauses, class action waivers
+8. PAYMENT_TERMS — late fees, price escalation, audit rights, currency/FX risk
+9. CONFIDENTIALITY — NDA terms, carve-outs, survival period, permitted disclosures
+10. FORCE_MAJEURE — scope of FM events, notice requirements, extended FM termination rights
+For each category return:
+{
+  "categoryId": "AUTO_RENEWAL",
+  "label": "Auto-renewal",
+  "score": 0-10,           // 0 = no risk, 10 = critical risk
+  "severity": "none|low|moderate|high|critical",
+  "summary": "One sentence explaining the risk level.",
+  "flags": [
+    {
+      "flagId": "AR_001",
+      "excerpt": "Exact quoted text from contract (max 300 chars)",
+      "location": "Section 4.2" or "Page 3" or "Unknown",
+      "risk": "Plain-English explanation of why this is a risk (2-3 sentences)",
+      "suggestedRedline": "Specific alternative language the user could propose"
+    }
+  ]
+}
+Return a JSON object with this exact shape:
+{
+  "analysisVersion": "1.0",
+  "contractSummary": "2-3 sentence overview of what this contract is and who the parties are.",
+  "overallRiskScore": 0-10,
+  "categories": [ ...array of 10 category objects above... ]
+}
+
+CONTRACT TEXT:
+---
+{CONTRACT_TEXT}
+---
+```
+### Chunking Strategy
+If `rawText.length > 40000` characters:
+- Split into overlapping chunks of 35,000 chars with 2,000-char overlap.
+- Analyze each chunk independently with the same prompt, appending `"(Analyzing section X of Y)"` to the user message.
+- After all chunks complete, merge: deduplicate flags by excerpt similarity (simple string includes check), take the highest score per category, concatenate summaries.
+- If more than 3 chunks are needed, warn the user: `"Large document — analysis may take up to 90 seconds."`.
+### Response Parsing
+Wrap JSON.parse in try/catch. If parsing fails:
+- Log the raw Claude response to server console.
+- Return `{ error: "Analysis returned malformed data. Please try again." }` to the client.
+- Do NOT surface raw Claude output to the user.
+Validate the parsed object has `categories` array of length 10. If not, return the same error.
+---
+## FRONTEND — `public/index.html`
+Single HTML file. All CSS in `<style>`, all JS in `<script>`. No external CDN dependencies except one: use **no** external libraries. Pure DOM APIs only.
+### Views (show/hide with CSS class toggling, no routing)
+1. **Upload View** — file drop zone + file picker + plain-text paste toggle
+2. **Processing View** — animated progress indicator with status messages
+3. **Dashboard View** — risk matrix + flagged clauses + decision panel
+4. **Report View** — print-ready summary of all decisions
+### Upload View
+- Drag-and-drop zone that accepts `.pdf` and `.txt` only. Visual highlight on drag-over.
+- File picker button as fallback.
+- "Paste contract text" toggle that shows a `<textarea>` (min 300px tall) as an alternative input method. When using paste mode, POST the text directly as `Content-Type: text/plain` to `/api/upload`.
+- Client-side file size check before upload: if > 5 MB, show inline error without hitting the server.
+- Accepted formats label: `"Accepts: PDF or plain text (.txt) up to 5 MB"`
+- On submit, transition to Processing View.
+### Processing View
+Show a pulsing status indicator. Cycle through these messages with 4-second intervals while waiting for `/api/analyze`:
+- `"Extracting contract text..."`
+- `"Identifying parties and key terms..."`
+- `"Scanning auto-renewal and termination clauses..."`
+- `"Analyzing IP ownership and data rights..."`
+- `"Scoring indemnification and liability exposure..."`
+- `"Compiling risk report..."`
+If the server returns an error at any stage, exit Processing View, show a clearly styled error banner with the server's error message, and re-show the Upload View.
+### Dashboard View
+#### Risk Matrix (top of page)
+Horizontal bar chart rendered in pure SVG (inline, no library). 10 bars, one per category. Bar width proportional to score (0–10). Color: score 0–3 = `#22c55e`, 4–6 = `#f59e0b`, 7–8 = `#ef4444`, 9–10 = `#dc2626`. Show score as a number label at end of each bar. Bars are clickable — clicking jumps to that category's flags below.
+Overall risk score displayed prominently as a large number with a severity badge.
+If truncation occurred, show a yellow banner: `"⚠ This contract was truncated at 50,000 characters. Clauses beyond that point were not reviewed."`.
+#### Flags Panel
+For each category with `severity !== "none"`, render a collapsible section (open by default). Inside each section, render one card per flag containing:
+- Quoted excerpt in a `<blockquote>` styled element (monospace, light background)
+- Location label (e.g. `Section 4.2`)
+- Risk explanation paragraph
+- Suggested redline in a distinctly styled box labeled `"Suggested alternative language"`
+- Decision buttons: **Accept Risk** | **Escalate to Counsel** | **Request Redline**
+- Optional note textarea (appears on any button click, before confirmation)
+- Confirmation button that submits the decision to `/api/decision`
+- Once decided, the card shows a locked state: grayed out with a status badge showing the chosen action and timestamp. Decision can be reversed by clicking `"Change decision"`.
+Progress tracker at top of Flags Panel: `"3 of 7 flags reviewed"`. The Generate Report button is disabled and visually muted until all flags are actioned. On hover of a disabled Generate Report button, show tooltip: `"Review all flagged clauses to unlock the report."`
+#### Categories with No Flags
+Show a collapsed section for each `severity === "none"` category with a green checkmark and the summary text. Do not expand by default.
+### Report View
+Triggered when all flags are actioned and user clicks Generate Report. Fetch `/api/report/:sessionId`. Render:
+- Header: ContractGuard logo text, contract filename, date/time of analysis
+- Overall risk score + severity
+- Contract summary paragraph
+- Table: all 10 categories, their scores, and summaries
+- Per-flag breakdown: excerpt → risk → human decision → note
+- Footer: `"This report was generated by ContractGuard. It does not constitute legal advice. All decisions were made by a human reviewer."`
+Include a `window.print()` button styled as a primary action. Print CSS: hide the button, set font to serif, show all sections expanded.
+---
+## ERROR HANDLING — EXHAUSTIVE MATRIX
+| Scenario | Severity | Handling |
+|----------|----------|----------|
+| Missing `ANTHROPIC_API_KEY` secret | Critical | `process.exit(1)` on startup with console message |
+| Upload > 5 MB | Low | Client-side rejection before server hit |
+| Wrong file type | Low | `415` from server, shown as inline error |
+| Password-protected PDF | Moderate | Specific user-readable message, return to Upload View |
+| Scanned image PDF | Moderate | Specific user-readable message, return to Upload View |
+| Corrupt or malformed PDF | Moderate | Specific user-readable message, return to Upload View |
+| Empty text file | Low | Specific user-readable message, return to Upload View |
+| Claude API rate limit (`429`) | Moderate | Retry once after 10 seconds. If still `429`, show: `"Analysis service is busy — please try again in a minute."` |
+| Claude API `529` / overloaded | Moderate | Same retry logic as `429` |
+| Claude API `500` | High | Show: `"Analysis service error. Please try again."` Do not retry automatically. |
+| Claude API timeout (>60s) | High | `504` to client: `"Analysis timed out. Try uploading a shorter section of the contract."` |
+| Malformed JSON from Claude | High | Log server-side, return generic error to client. Never expose raw LLM output. |
+| Session not found (expired) | Moderate | `404` with message: `"Session expired. Please re-upload your contract."` |
+| Network drop during analysis | Moderate | Frontend polls `/api/analyze` status every 5 seconds. If 3 consecutive failures, show error and offer retry. |
+| User navigates away mid-analysis | Low | Session persists in server memory for 30 min. On return, if sessionId is in localStorage, attempt to resume. |
+| Concurrent uploads from same browser | Low | Each upload creates a new sessionId. Old session is not invalidated (they time out naturally). |
+| Contract text is not English | Low | Claude will still analyze it. Add a note in the UI: `"Best results on English-language contracts. Non-English contracts may have reduced accuracy."` — show only if Claude's `contractSummary` contains no recognizable English words (basic heuristic: check for common English stopwords). |
+| Claude returns fewer than 10 categories | High | Detect in parser, treat as malformed response, return error. |
+| Flag excerpt is empty string | Low | Skip rendering that flag card. Log server-side as `WARN: empty excerpt in flagId`. |
+| User submits decision with empty note when Escalate is chosen | Low | Note is optional. No validation block. |
+| Generate Report clicked with unreviewed flags | N/A | Button is disabled — this state is unreachable by design. |
+---
+## DESIGN CONSTRAINTS
+- **Color palette:** White background. `#111827` primary text. `#6B7280` secondary text. Risk colors: green `#22c55e`, amber `#f59e0b`, red `#ef4444`, critical `#dc2626`. Accent blue `#2563eb` for buttons and links.
+- **Typography:** System font stack — `'Inter', 'Segoe UI', sans-serif`. No web fonts (Replit cold-start performance).
+- **Layout:** Max width `860px`, centered, `24px` horizontal padding. Mobile responsive at `480px` breakpoint — stack all columns, full-width cards.
+- **Buttons:** Minimum `44px` touch target. Disabled state: `opacity: 0.4`, `cursor: not-allowed`. No hover effect on disabled.
+- **Animations:** CSS only. Spinner for loading state. Smooth `max-height` transition on collapsible sections (`transition: max-height 0.25s ease`).
+- **Accessibility:** All interactive elements have `aria-label` or visible label. Color is never the sole indicator of status — pair with icon or text badge. Focus rings visible (`outline: 2px solid #2563eb`).
+- **No external requests from frontend** except to the app's own Express server. No CDNs, no analytics, no fonts.
+---
+## REPLIT-SPECIFIC REQUIREMENTS
+
+- Set `"main": "index.js"` in `package.json`.
+- `.replit` run command: `node index.js`.
+- Use `express.static('public')` to serve frontend assets.
+- Use `multer` for multipart file upload handling (in-memory storage, no disk writes).
+- Do not use `__dirname` for path resolution inside Replit — use `path.join(process.cwd(), 'public')` instead.
+- The Replit environment restarts on every deploy. All in-memory sessions are lost on restart. This is acceptable — document it as a known limitation in the UI: a small footer note: `"Sessions are not persisted across server restarts."`.
+- Set `"type": "module"` only if using ES modules throughout consistently. Otherwise use CommonJS (`require`) for all files — do not mix module systems.
+- Use `npm install` (not `pnpm` or `yarn`) to match Replit's default toolchain.
+
+---
+## PACKAGES TO INSTALL
+```bash
+npm install express multer pdf-parse @anthropic-ai/sdk uuid
+```
+No other packages. If you find yourself reaching for another package, solve it in plain JS first.
+---
+## DEFINITION OF DONE
+The build is complete when all of the following are true:
+
+- [ ] PDF upload extracts text and handles all 4 failure modes with specific messages
+- [ ] Plain-text paste mode works as an alternative input
+- [ ] Claude analysis runs and returns valid JSON for all 10 categories
+- [ ] Risk matrix SVG renders correctly with color-coded bars
+- [ ] Every flagged clause has Accept / Escalate / Redline decision buttons
+- [ ] Decisions are persisted in session state and reflected in locked card UI
+- [ ] Generate Report button is disabled until all flags are actioned
+- [ ] Generated report is print-ready and contains the legal disclaimer
+- [ ] All error states in the matrix above are handled and shown gracefully
+- [ ] App loads, uploads, and analyzes within 90 seconds on a standard Replit container
+- [ ] No API key, session data, or raw LLM output is ever exposed to the frontend
+- [ ] Mobile layout works at 480px width without horizontal scroll
+---
+## WHAT NOT TO BUILD
+- No user accounts, login, or authentication
+- No database or persistent storage
+- No contract comparison or history
+- No email or notification system
+- No multi-language support beyond the English-detection heuristic
+- No fine-tuning or model training
+- No admin panel
+- No payments
+Scope is fixed. Build what is specified above with full robustness. Depth over breadth.
+---
+*ContractGuard — Built for Replit 10 Year Buildathon*

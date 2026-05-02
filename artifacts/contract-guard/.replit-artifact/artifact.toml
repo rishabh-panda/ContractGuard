@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "ContractGuard"
+version = "1.0.0"
+id = "artifacts/contract-guard"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23598
+
+[services.development]
+run = "pnpm --filter @workspace/contract-guard run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/contract-guard", "run", "build" ]
+publicDir = "artifacts/contract-guard/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23598"
+BASE_PATH = "/"
