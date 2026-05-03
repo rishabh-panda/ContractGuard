@@ -1,5 +1,5 @@
 import { Router } from "express";
-import multer from "multer";
+import multer, { type MulterError } from "multer";
 import { v4 as uuidv4 } from "uuid";
 import { extractPdf, extractText } from "../lib/extractor.js";
 import { analyzeContract } from "../lib/analyzer.js";
@@ -18,6 +18,13 @@ router.post("/upload", (req, res, next) => {
 
   // Handle plain-text paste
   if (contentType.startsWith("text/plain")) {
+    // Enforce 5MB limit for text body too
+    const contentLength = parseInt(req.headers["content-length"] ?? "0", 10);
+    if (contentLength > 5 * 1024 * 1024) {
+      res.status(413).json({ error: "Text content exceeds 5 MB limit." });
+      return;
+    }
+
     let body = "";
     req.setEncoding("utf-8");
     req.on("data", (chunk: string) => { body += chunk; });
@@ -37,7 +44,15 @@ router.post("/upload", (req, res, next) => {
         uploadedAt: Date.now(),
         truncated: result.truncated ?? false,
       });
-      res.json({ sessionId, filename: "pasted-contract.txt", charCount: result.text!.length, truncated: result.truncated ?? false });
+      res.json({
+        sessionId,
+        filename: "pasted-contract.txt",
+        charCount: result.text!.length,
+        truncated: result.truncated ?? false,
+      });
+    });
+    req.on("error", () => {
+      res.status(400).json({ error: "Failed to read request body." });
     });
     return;
   }
@@ -45,8 +60,13 @@ router.post("/upload", (req, res, next) => {
   // Handle multipart file upload
   upload.single("file")(req, res, async (err) => {
     if (err) {
-      if (err.code === "LIMIT_FILE_SIZE") {
-        res.status(413).json({ error: "File exceeds 5 MB limit." });
+      const multerErr = err as MulterError;
+      // Multer v2 may use .type or .code for the error kind
+      const isFileSizeError =
+        multerErr.code === "LIMIT_FILE_SIZE" ||
+        (multerErr as unknown as { type?: string }).type === "LIMIT_FILE_SIZE";
+      if (isFileSizeError) {
+        res.status(413).json({ error: "File exceeds 5 MB limit. Please upload a smaller file." });
         return;
       }
       next(err);
@@ -54,19 +74,25 @@ router.post("/upload", (req, res, next) => {
     }
 
     if (!req.file) {
-      res.status(400).json({ error: "No file uploaded." });
+      res.status(400).json({ error: "No file received. Please select a file to upload." });
       return;
     }
 
     const { mimetype, originalname, buffer } = req.file;
 
-    if (mimetype !== "application/pdf" && mimetype !== "text/plain") {
-      res.status(415).json({ error: "Unsupported file type. Please upload a PDF or .txt file." });
+    // Validate by MIME type AND file extension
+    const lcName = originalname.toLowerCase();
+    const validMime = mimetype === "application/pdf" || mimetype === "text/plain";
+    const validExt = lcName.endsWith(".pdf") || lcName.endsWith(".txt");
+
+    if (!validMime && !validExt) {
+      res.status(415).json({ error: "Unsupported file type. Please upload a PDF (.pdf) or plain text (.txt) file." });
       return;
     }
 
+    const isPdf = mimetype === "application/pdf" || lcName.endsWith(".pdf");
     let extraction;
-    if (mimetype === "application/pdf") {
+    if (isPdf) {
       extraction = await extractPdf(buffer);
     } else {
       extraction = extractText(buffer);
@@ -110,8 +136,9 @@ router.post("/analyze", async (req, res) => {
     return;
   }
 
+  // Return cached analysis if already done
   if (session.analysis) {
-    res.json({ analysis: session.analysis, truncated: session.truncated });
+    res.json({ analysis: session.analysis, truncated: session.truncated, largeDocument: false });
     return;
   }
 
@@ -121,7 +148,10 @@ router.post("/analyze", async (req, res) => {
 
   try {
     const analysisPromise = analyzeContract(session.rawText);
-    const { result, error, largeDocument } = await Promise.race([analysisPromise, timeout]) as Awaited<ReturnType<typeof analyzeContract>>;
+    const { result, error, largeDocument } = await Promise.race([
+      analysisPromise,
+      timeout,
+    ]) as Awaited<ReturnType<typeof analyzeContract>>;
 
     if (error) {
       res.status(500).json({ error });
@@ -129,11 +159,17 @@ router.post("/analyze", async (req, res) => {
     }
 
     updateSession(sessionId, { analysis: result! });
-    res.json({ analysis: result!, truncated: session.truncated, largeDocument: largeDocument ?? false });
+    res.json({
+      analysis: result!,
+      truncated: session.truncated,
+      largeDocument: largeDocument ?? false,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg === "TIMEOUT") {
-      res.status(504).json({ error: "Analysis timed out. Try uploading a shorter section of the contract." });
+      res.status(504).json({
+        error: "Analysis timed out. Try uploading a shorter section of the contract.",
+      });
       return;
     }
     res.status(500).json({ error: "Analysis failed. Please try again." });
@@ -161,9 +197,15 @@ router.post("/decision", (req, res) => {
   }
 
   const decisions = { ...session.decisions };
-  decisions[flagId] = { action, note: note ?? "", decidedAt: Date.now() };
-  updateSession(sessionId, { decisions });
 
+  // Allow clearing a decision (action = "__cleared__")
+  if (action === "__cleared__") {
+    delete decisions[flagId];
+  } else {
+    decisions[flagId] = { action, note: note ?? "", decidedAt: Date.now() };
+  }
+
+  updateSession(sessionId, { decisions });
   res.json({ ok: true, decisions });
 });
 

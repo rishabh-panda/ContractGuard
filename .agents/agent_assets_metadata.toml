@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "CaUbx5zbkWC7KJQMR04n-"
+uri = "file://README.md"
+type = "text"
+title = "ContractGuard — Full Project README"
