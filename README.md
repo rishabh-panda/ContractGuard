@@ -8,6 +8,23 @@ This is not a summarizer. It is a **decision-forcing workflow tool**.
 
 ---
 
+## Preview
+<img width="1266" height="871" alt="image" src="https://github.com/user-attachments/assets/de49b13c-e5fd-4568-860c-7ce42f03ea51" />
+
+---
+
+<img width="1264" height="872" alt="image" src="https://github.com/user-attachments/assets/2f845fc3-4926-4e6e-8401-6d6bea3c2249" />
+
+---
+
+<img width="1263" height="872" alt="image" src="https://github.com/user-attachments/assets/6d52195d-a1a6-43c5-8e4b-5e9d3b483ead" />
+
+---
+
+<img width="1265" height="871" alt="image" src="https://github.com/user-attachments/assets/b7375698-0211-4e69-936c-38b118904937" />
+
+---
+
 ## Table of Contents
 
 - [Demo Flow](#demo-flow)
